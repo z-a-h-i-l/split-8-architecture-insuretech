@@ -1,1 +1,9 @@
-# split-8-architecture-insuretech
+# Задание 1
+
+- Используем регион Yandex Cloud с двумя зонами доступности.
+- Каждый сервис разворачивается минимум в двух репликах, распределённых по зонам.
+- Статика отдаётся через CDN (например, Yandex Cloud CDN).
+- Для динамических запросов — геобалансировка на уровне DNS или HTTP-балансировщика (Application Load Balancer Yandex Cloud), который умеет направлять трафик в ближайший бэкенд.
+
+[схема в drawio](./task-1/start_scheme-1.drawio)
+![схема](./task-1/start_scheme.drawio.png)
