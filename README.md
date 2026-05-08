@@ -98,3 +98,60 @@ kubectl get --raw "/apis/custom.metrics.k8s.io/v1beta1/namespaces/default/pods/*
 
 
 ![diagram_containers](./task-3/diagram_containers.png)
+
+
+# Задание 4
+
+## Решения по архитектуре ОСАГО:
+
+### 1. **osago-aggregator**:
+- **Нужна своя БД** (osago-db) для хранения:
+  - Заявок, отправленных в страховые компании
+  - Результатов опросов
+  - Статусов заявок
+  - Корреляции внутренней заявки с заявками в разных СК
+
+### 2. **API osago-aggregator для core-app**:
+- REST API для создания заявки
+- REST API для получения статуса
+- WebSocket/SSE для push-уведомлений
+
+### 3. **Интеграция core-app ↔ osago-aggregator**:
+- Синхронный REST для создания заявки
+- Асинхронный WebSocket для получения результатов
+
+### 4. **API для веб-приложения**:
+- REST для создания заявки
+- **Server-Sent Events (SSE)** для получения предложений в реальном времени
+
+### 5. **Паттерны отказоустойчивости**:
+- **Timeout**: 60 секунд при вызове страховых компаний
+- **Retry**: при временных ошибках опроса СК
+- **Circuit Breaker**: защита от недоступных СК
+- **Rate Limiting**: 
+  - Для веб-приложения (2500 пользователей)
+  - Для вызовов к СК (ограничения API)
+
+## Детали применения паттернов:
+
+### **Web → CoreApp**:
+- **Rate Limiting**: защита от 2500 одновременных пользователей
+- **Timeout**: ограничение времени запроса
+- **SSE**: для push-уведомлений о предложениях ОСАГО
+
+### **CoreApp → osago-aggregator**:
+- **Timeout**: ограничение времени ответа
+- **Retry**: повтор при временных ошибках
+- WebSocket для асинхронных уведомлений
+
+### **osago-aggregator → Страховые компании**:
+- **Timeout (60 сек)**: максимальное время ожидания
+- **Retry**: повторный опрос при ошибках
+- **Circuit Breaker**: отключение недоступных СК
+- **Rate Limiting**: соблюдение лимитов API СК
+
+
+[diagram_containers.drawio](./task-4/diagram_containers.drawio)
+
+
+![diagram_containers](./task-4/diagram_containers.png)
