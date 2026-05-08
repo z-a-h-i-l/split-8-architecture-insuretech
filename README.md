@@ -155,3 +155,210 @@ kubectl get --raw "/apis/custom.metrics.k8s.io/v1beta1/namespaces/default/pods/*
 
 
 ![diagram_containers](./task-4/diagram_containers.png)
+
+
+# Задание 5
+
+## Анализ существующего REST API
+
+**Ключевые ресурсы:**
+1. **Client** - основная сущность клиента (id, name, age)
+2. **Document** - документы клиента (id, type, number, issueDate, expiryDate)
+3. **Relative** - родственники клиента (id, relationType, name, age)
+
+**Текущие эндпоинты:**
+- `GET /clients/{id}` - получение информации о клиенте
+- `GET /clients/{id}/documents` - список документов
+- `GET /clients/{id}/relatives` - информация о родственниках
+
+**Проблема:** Для полного получения данных клиента требуется 3 отдельных запроса, что увеличивает RPS.
+
+## GraphQL Schema
+
+```graphql
+# =====================================================
+# GraphQL Schema для сервиса client-info
+# =====================================================
+
+# Корневой тип запросов
+type Query {
+  """
+  Получить информацию о клиенте по ID
+  """
+  client(id: ID!): Client
+}
+
+# Основная сущность Клиент
+type Client {
+  """
+  Уникальный идентификатор клиента
+  """
+  id: ID!
+  
+  """
+  ФИО клиента
+  """
+  name: String!
+  
+  """
+  Возраст клиента
+  """
+  age: Int!
+  
+  """
+  Список документов клиента
+  """
+  documents: [Document!]!
+  
+  """
+  Список родственников клиента
+  """
+  relatives: [Relative!]!
+}
+
+# Сущность Документ
+type Document {
+  """
+  Уникальный идентификатор документа
+  """
+  id: ID!
+  
+  """
+  Тип документа (паспорт, водительские права и т.д.)
+  """
+  type: String!
+  
+  """
+  Номер документа
+  """
+  number: String!
+  
+  """
+  Дата выдачи документа
+  """
+  issueDate: String!
+  
+  """
+  Дата окончания действия документа
+  """
+  expiryDate: String!
+}
+
+# Сущность Родственник
+type Relative {
+  """
+  Уникальный идентификатор родственника
+  """
+  id: ID!
+  
+  """
+  Тип родства (супруг, ребенок, родитель и т.д.)
+  """
+  relationType: String!
+  
+  """
+  ФИО родственника
+  """
+  name: String!
+  
+  """
+  Возраст родственника
+  """
+  age: Int!
+}
+```
+
+## Примеры запросов
+
+### Пример 1: Только базовая информация о клиенте
+```graphql
+query GetClientBasicInfo($id: ID!) {
+  client(id: $id) {
+    id
+    name
+    age
+  }
+}
+```
+**Раньше:** 1 REST запрос  
+**Сейчас:** 1 GraphQL запрос (без изменений, но можно выбрать только нужные поля)
+
+### Пример 2: Клиент с документами
+```graphql
+query GetClientWithDocuments($id: ID!) {
+  client(id: $id) {
+    id
+    name
+    documents {
+      id
+      type
+      number
+      issueDate
+      expiryDate
+    }
+  }
+}
+```
+**Раньше:** 2 REST запроса (клиент + документы)  
+**Сейчас:** 1 GraphQL запрос
+
+### Пример 3: Клиент с родственниками
+```graphql
+query GetClientWithRelatives($id: ID!) {
+  client(id: $id) {
+    id
+    name
+    relatives {
+      id
+      relationType
+      name
+      age
+    }
+  }
+}
+```
+**Раньше:** 2 REST запроса (клиент + родственники)  
+**Сейчас:** 1 GraphQL запрос
+
+### Пример 4: Полная информация о клиенте
+```graphql
+query GetCompleteClientInfo($id: ID!) {
+  client(id: $id) {
+    id
+    name
+    age
+    documents {
+      id
+      type
+      number
+      issueDate
+      expiryDate
+    }
+    relatives {
+      id
+      relationType
+      name
+      age
+    }
+  }
+}
+```
+**Раньше:** 3 REST запроса (клиент + документы + родственники)  
+**Сейчас:** 1 GraphQL запрос
+
+### Пример 5: Выборочные поля для оптимизации
+```graphql
+query GetClientOptimized($id: ID!) {
+  client(id: $id) {
+    name
+    documents {
+      type
+      number
+    }
+    relatives {
+      name
+      relationType
+    }
+  }
+}
+```
