@@ -362,3 +362,63 @@ query GetClientOptimized($id: ID!) {
   }
 }
 ```
+
+# Задание 6
+
+## Настройка Rate Limiting в Nginx
+
+Вот доработанный конфигурационный файл с ограничением запросов:
+
+```nginx
+http {
+    # =====================================================
+    # Зона ограничения запросов (Rate Limiting)
+    # =====================================================
+    # $binary_remote_addr - ключ ограничения (бинарный формат IP клиента)
+    # zone=partner_limit:10m - имя зоны и размер памяти (10MB ~ 160K уникальных IP)
+    # rate=10r/m - максимальная скорость: 10 запросов в минуту
+    limit_req_zone $binary_remote_addr zone=partner_limit:10m rate=10r/m;
+
+    # Код ответа при превышении лимита: 429 Too Many Requests
+    limit_req_status 429;
+    
+    # Опционально: логирование отклонённых запросов
+    limit_req_log_level warn;
+
+    # Настройка upstream для балансировки нагрузки
+    upstream backend_servers {
+        server backend1.example.com;
+        server backend2.example.com;
+        server backend3.example.com;
+    }
+
+    server {
+        listen 80;
+
+        location / {
+            # Применение ограничения запросов:
+            # burst=5 - разрешает кратковременный всплеск до 5 запросов сверх лимита
+            # nodelay - обрабатывать запросы из burst немедленно (не ставить в очередь)
+            limit_req zone=partner_limit burst=5 nodelay;
+            
+            proxy_pass http://backend_servers;
+            
+            # Опционально: заголовки для отладки и мониторинга
+            add_header X-RateLimit-Limit 10;
+            add_header X-RateLimit-Remaining $limit_req_remaining always;
+            add_header X-RateLimit-Retry-After 60 always;
+        }
+    }
+}
+```
+
+## Пояснение директив
+
+| Директива | Назначение |
+|-----------|-----------|
+| `limit_req_zone` | Определяет зону ограничения: ключ (по IP), размер памяти и скорость |
+| `rate=10r/m` | Разрешает максимум **10 запросов в минуту** на один ключ (IP) |
+| `limit_req_status 429` | Возвращает стандартный код **429 Too Many Requests** при превышении |
+| `burst=5` | Позволяет кратковременный «всплеск» до 5 дополнительных запросов |
+| `nodelay` | Запросы в пределах burst обрабатываются сразу, а не ставятся в очередь |
+| `limit_req_log_level warn` | Логирует отклонённые запросы для мониторинга |
