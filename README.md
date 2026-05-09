@@ -1,1 +1,452 @@
-# split-8-architecture-insuretech
+# Задание 1
+
+### Анализ проблем и предлагаемые решения
+
+1.  **Проблема: Медленная загрузка страниц (50 RPS — предел).**
+    *   **Решение:**
+        *   **CDN (Content Delivery Network):** Для раздачи статики (JS, CSS, картинки) веб-приложения `InsureTech Web`. Это обеспечит быструю загрузку из любой точки РФ.
+        *   **Кэширование (Redis):** Внедрение Redis перед базой данных и агрегатором. Данные о тарифах и продуктах (которые меняются не ежесекундно) должны кэшироваться. Это снимет нагрузку с `core-app` и базы данных.
+        *   **HPA (Horizontal Pod Autoscaler):** Настроить автомасштабирование подов в Kubernetes в зависимости от нагрузки CPU/RAM.
+
+2.  **Проблема: Нарушение SLA из-за одного партнера (250 RPS вместо 20 RPS).**
+    *   **Решение:**
+        *   **API Gateway / Ingress Controller с Rate Limiting:** Внедрение шлюза (например, Nginx Ingress или Kong), который будет ограничивать количество запросов (Rate Limiting) для каждого партнера/клиента индивидуально. Если партнер превышает лимит, его запросы блокируются (HTTP 429), не затрагивая остальных.
+
+3.  **Проблема: Падение приложения и медленная реакция.**
+    *   **Решение:**
+        *   **Мониторинг (Prometheus + Grafana + Alertmanager):** Сбор метрик со всех сервисов. Настройка алертов (в Telegram/Slack/SMS) при росте ошибок или времени отклика, чтобы команда узнавала о проблемах раньше пользователей.
+        *   **Liveness/Readiness Probes:** Настройка проверок здоровья в Kubernetes для автоматического перезапуска упавших контейнеров.
+        *   **Multi-AZ Deployment:** Размещение нод Kubernetes в разных зонах доступности (AZ). Если одна зона падает, трафик перераспределяется на другую.
+
+4.  **Проблема: Требования к отказоустойчивости (RTO 45m, RPO 15m) и регионы.**
+    *   **Решение:**
+        *   **База данных (PostgreSQL HA):** Кластер PostgreSQL с мастером в одной зоне и стендбаем (Standby) в другой зоне. Синхронная репликация внутри региона (для защиты от потери данных при падении ноды).
+        *   **Гео-распределение:** Для соблюдения требования «одинаковое время загрузки из всех регионов», можно развернуть реплику БД (Read Replica) в удаленном регионе (например, Сибирь/Дальний Восток) и настроить асинхронную репликацию. Это укладывается в RPO 15 мин (допустима потеря последних 15 мин данных при аварии).
+
+### Геобалансировка
+
+1.  **Geo-DNS / GSLB (Global Server Load Balancer):** На самом верху. Маршрутизирует пользователя в ближайший активный регион на основе GeoIP.
+2.  **Разделение зон PostgreSQL:**
+    *   **region-a:** Используется **Синхронная репликация**. Это гарантирует, что если мастер упадет, стендбай в соседней зоне подхватит нагрузку без потери данных (RPO=0).
+    *   **region-b** Используется **Асинхронная репликация**. Данные доставляются с небольшой задержкой, но это позволяет обслуживать регион (Сибирь/ДВ) без потери доступности, если упадет основной регион.
+3.  **Failover Strategy (Красные пунктирные линии):**
+    *   **Сценарий A (Падение зоны):** При падении region-a в K8s трафик идет в region-b, а в БД происходит авто-переключение на Sync Replica.
+    *   **Сценарий B (Падение региона):** Если падает весь region-a, DNS перенаправляет весь трафик в region-b. Там Асинхронная реплика повышается до Мастера.
+
+[схема в drawio](./task-1/start_scheme-1.drawio)
+
+![схема](./task-1/start_scheme.drawio.png)
+
+
+# Задание 2
+
+## Часть 1
+Собираем образ `scaletestapp` из репозитория `https://github.com/Yandex-Practicum/scaletestapp`
+
+Устанавливаем locust
+
+```bash
+minikube start --memory=4096 --cpus=2
+
+minikube image load scaletestapp
+
+minikube addons enable metrics-server
+
+kubectl apply -f deployment.yaml
+kubectl apply -f service.yaml
+kubectl apply -f hpa-memory.yaml
+
+kubectl apply -f servicemonitor.yaml
+
+minikube service test-app-service --url
+
+locust -f locustfile.py --host http://[service_url]:[service_port]
+
+```
+
+Получили увеличение подов
+![image-1](./task-2/image-1.png)
+![image-2](./task-2/image-2.png)
+
+## Часть 2
+
+```bash
+helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+
+helm install monitoring prometheus-community/kube-prometheus-stack \
+  --namespace monitoring --create-namespace
+
+helm install prometheus-adapter prometheus-community/prometheus-adapter \
+--set prometheus.url=http://prometheus-server.smonitoring.svc.cluster.local \
+--namespace monitoring
+
+kubectl apply -f hpa-rps.yaml
+
+kubectl get --raw "/apis/custom.metrics.k8s.io/v1beta1/namespaces/default/pods/*/http_requests_per_second" | jq .
+```
+
+Получили увеличение подов
+![image-3](./task-2/image-3.png)
+![image-4](./task-2/image-4.png)
+
+
+# Задание 3
+### 1. Анализ проблем и рисков
+
+**Проблемы:**
+1.  **Синхронная зависимость:** Сервисы `core-app` и `ins-comp-settlement` напрямую зависят от времени ответа `ins-product-aggregator`, который, в свою очередь, опрашивает 5 (скоро 10) внешних страховых компаний. Это создает "узкое горлышко" и долгие ответы.
+2.  **Отсутствие изоляции:** Партнер, превышающий лимиты, блокирует работу всей системы, так как ресурсы Kubernetes-пода распределяются равномерно.
+3.  **Поллинг данных:** Использование периодического опроса (раз в 15 минут или раз в сутки) приводит к задержкам в актуальности данных и лишней нагрузке на сеть.
+
+**Риски при росте нагрузки:**
+*   Полная недоступность сервиса (Downtime) во время рекламной кампании из-за исчерпания ресурсов CPU/Memory подами `core-app`.
+*   Потеря данных о заявках, если `ins-comp-settlement` не успеет опросить `core-app` в момент сбоя.
+
+### 2. Предлагаемое решение
+
+1.  **Внедрение Message Broker (Kafka):**
+    *   Внедряем брокер сообщений для асинхронного обмена данными.
+2.  **Event-Streaming для продуктов:**
+    *   `ins-product-aggregator` асинхронно собирает данные от страховых компаний и публикует событие `ProductUpdated` в Kafka.
+    *   `core-app` и `ins-comp-settlement` подписываются на топик и обновляют свои локальные кэши. Это убирает синхронные вызовы к агрегатору.
+3.  **Event-Streaming для заявок:**
+    *   `core-app` публикует событие `ApplicationCreated` при оформлении страховки.
+    *   `ins-comp-settlement` подписывается на это событие, получая данные в реальном времени без опроса.
+4.  **Transactional Outbox:**
+    *   Используем паттерн Transactional Outbox в `core-app` (и `ins-product-aggregator`), чтобы гарантировать, что событие в Kafka будет отправлено только при успешном сохранении данных в БД.
+
+### Основные изменения на схеме:
+1.  Добавлен компонент **Message Broker (Kafka)**.
+2.  **ins-product-aggregator** больше не вызывается синхронно. Он отправляет данные в Kafka.
+3.  **core-app** и **ins-comp-settlement** получают данные о продуктах из Kafka (обновляя локальную реплику).
+4.  **ins-comp-settlement** получает данные о заявках из Kafka (события от core-app), отпадая необходимость в REST-запросе к core-app раз в сутки.
+
+
+[diagram_containers.drawio](./task-3/diagram_containers.drawio)
+
+
+![diagram_containers](./task-3/diagram_containers.png)
+
+
+# Задание 4
+
+## Решения по архитектуре ОСАГО:
+
+### 1. **osago-aggregator**:
+- **Нужна своя БД** (osago-db) для хранения:
+  - Заявок, отправленных в страховые компании
+  - Результатов опросов
+  - Статусов заявок
+  - Корреляции внутренней заявки с заявками в разных СК
+
+### 2. **API osago-aggregator для core-app**:
+- REST API для создания заявки
+- REST API для получения статуса
+- WebSocket/SSE для push-уведомлений
+
+### 3. **Интеграция core-app ↔ osago-aggregator**:
+- Синхронный REST для создания заявки
+- Асинхронный WebSocket для получения результатов
+
+### 4. **API для веб-приложения**:
+- REST для создания заявки
+- **Server-Sent Events (SSE)** для получения предложений в реальном времени
+
+### 5. **Паттерны отказоустойчивости**:
+- **Timeout**: 60 секунд при вызове страховых компаний
+- **Retry**: при временных ошибках опроса СК
+- **Circuit Breaker**: защита от недоступных СК
+- **Rate Limiting**: 
+  - Для веб-приложения (2500 пользователей)
+  - Для вызовов к СК (ограничения API)
+
+## Детали применения паттернов:
+
+### **Web → CoreApp**:
+- **Rate Limiting**: защита от 2500 одновременных пользователей
+- **Timeout**: ограничение времени запроса
+- **SSE**: для push-уведомлений о предложениях ОСАГО
+
+### **CoreApp → osago-aggregator**:
+- **Timeout**: ограничение времени ответа
+- **Retry**: повтор при временных ошибках
+- WebSocket для асинхронных уведомлений
+
+### **osago-aggregator → Страховые компании**:
+- **Timeout (60 сек)**: максимальное время ожидания
+- **Retry**: повторный опрос при ошибках
+- **Circuit Breaker**: отключение недоступных СК
+- **Rate Limiting**: соблюдение лимитов API СК
+
+
+[diagram_containers.drawio](./task-4/diagram_containers.drawio)
+
+
+![diagram_containers](./task-4/diagram_containers.png)
+
+
+# Задание 5
+
+## Анализ существующего REST API
+
+**Ключевые ресурсы:**
+1. **Client** - основная сущность клиента (id, name, age)
+2. **Document** - документы клиента (id, type, number, issueDate, expiryDate)
+3. **Relative** - родственники клиента (id, relationType, name, age)
+
+**Текущие эндпоинты:**
+- `GET /clients/{id}` - получение информации о клиенте
+- `GET /clients/{id}/documents` - список документов
+- `GET /clients/{id}/relatives` - информация о родственниках
+
+**Проблема:** Для полного получения данных клиента требуется 3 отдельных запроса, что увеличивает RPS.
+
+## GraphQL Schema
+
+```graphql
+# =====================================================
+# GraphQL Schema для сервиса client-info
+# =====================================================
+
+# Корневой тип запросов
+type Query {
+  """
+  Получить информацию о клиенте по ID
+  """
+  client(id: ID!): Client
+}
+
+# Основная сущность Клиент
+type Client {
+  """
+  Уникальный идентификатор клиента
+  """
+  id: ID!
+  
+  """
+  ФИО клиента
+  """
+  name: String!
+  
+  """
+  Возраст клиента
+  """
+  age: Int!
+  
+  """
+  Список документов клиента
+  """
+  documents: [Document!]!
+  
+  """
+  Список родственников клиента
+  """
+  relatives: [Relative!]!
+}
+
+# Сущность Документ
+type Document {
+  """
+  Уникальный идентификатор документа
+  """
+  id: ID!
+  
+  """
+  Тип документа (паспорт, водительские права и т.д.)
+  """
+  type: String!
+  
+  """
+  Номер документа
+  """
+  number: String!
+  
+  """
+  Дата выдачи документа
+  """
+  issueDate: String!
+  
+  """
+  Дата окончания действия документа
+  """
+  expiryDate: String!
+}
+
+# Сущность Родственник
+type Relative {
+  """
+  Уникальный идентификатор родственника
+  """
+  id: ID!
+  
+  """
+  Тип родства (супруг, ребенок, родитель и т.д.)
+  """
+  relationType: String!
+  
+  """
+  ФИО родственника
+  """
+  name: String!
+  
+  """
+  Возраст родственника
+  """
+  age: Int!
+}
+```
+
+## Примеры запросов
+
+### Пример 1: Только базовая информация о клиенте
+```graphql
+query GetClientBasicInfo($id: ID!) {
+  client(id: $id) {
+    id
+    name
+    age
+  }
+}
+```
+**Раньше:** 1 REST запрос  
+**Сейчас:** 1 GraphQL запрос (без изменений, но можно выбрать только нужные поля)
+
+### Пример 2: Клиент с документами
+```graphql
+query GetClientWithDocuments($id: ID!) {
+  client(id: $id) {
+    id
+    name
+    documents {
+      id
+      type
+      number
+      issueDate
+      expiryDate
+    }
+  }
+}
+```
+**Раньше:** 2 REST запроса (клиент + документы)  
+**Сейчас:** 1 GraphQL запрос
+
+### Пример 3: Клиент с родственниками
+```graphql
+query GetClientWithRelatives($id: ID!) {
+  client(id: $id) {
+    id
+    name
+    relatives {
+      id
+      relationType
+      name
+      age
+    }
+  }
+}
+```
+**Раньше:** 2 REST запроса (клиент + родственники)  
+**Сейчас:** 1 GraphQL запрос
+
+### Пример 4: Полная информация о клиенте
+```graphql
+query GetCompleteClientInfo($id: ID!) {
+  client(id: $id) {
+    id
+    name
+    age
+    documents {
+      id
+      type
+      number
+      issueDate
+      expiryDate
+    }
+    relatives {
+      id
+      relationType
+      name
+      age
+    }
+  }
+}
+```
+**Раньше:** 3 REST запроса (клиент + документы + родственники)  
+**Сейчас:** 1 GraphQL запрос
+
+### Пример 5: Выборочные поля для оптимизации
+```graphql
+query GetClientOptimized($id: ID!) {
+  client(id: $id) {
+    name
+    documents {
+      type
+      number
+    }
+    relatives {
+      name
+      relationType
+    }
+  }
+}
+```
+
+# Задание 6
+
+## Настройка Rate Limiting в Nginx
+
+Вот доработанный конфигурационный файл с ограничением запросов:
+
+```nginx
+http {
+    # =====================================================
+    # Зона ограничения запросов (Rate Limiting)
+    # =====================================================
+    # $binary_remote_addr - ключ ограничения (бинарный формат IP клиента)
+    # zone=partner_limit:10m - имя зоны и размер памяти (10MB ~ 160K уникальных IP)
+    # rate=10r/m - максимальная скорость: 10 запросов в минуту
+    limit_req_zone $binary_remote_addr zone=partner_limit:10m rate=10r/m;
+
+    # Код ответа при превышении лимита: 429 Too Many Requests
+    limit_req_status 429;
+    
+    # Опционально: логирование отклонённых запросов
+    limit_req_log_level warn;
+
+    # Настройка upstream для балансировки нагрузки
+    upstream backend_servers {
+        server backend1.example.com;
+        server backend2.example.com;
+        server backend3.example.com;
+    }
+
+    server {
+        listen 80;
+
+        location / {
+            # Применение ограничения запросов:
+            # burst=5 - разрешает кратковременный всплеск до 5 запросов сверх лимита
+            # nodelay - обрабатывать запросы из burst немедленно (не ставить в очередь)
+            limit_req zone=partner_limit burst=5 nodelay;
+            
+            proxy_pass http://backend_servers;
+            
+            # Опционально: заголовки для отладки и мониторинга
+            add_header X-RateLimit-Limit 10;
+            add_header X-RateLimit-Remaining $limit_req_remaining always;
+            add_header X-RateLimit-Retry-After 60 always;
+        }
+    }
+}
+```
+
+## Пояснение директив
+
+| Директива | Назначение |
+|-----------|-----------|
+| `limit_req_zone` | Определяет зону ограничения: ключ (по IP), размер памяти и скорость |
+| `rate=10r/m` | Разрешает максимум **10 запросов в минуту** на один ключ (IP) |
+| `limit_req_status 429` | Возвращает стандартный код **429 Too Many Requests** при превышении |
+| `burst=5` | Позволяет кратковременный «всплеск» до 5 дополнительных запросов |
+| `nodelay` | Запросы в пределах burst обрабатываются сразу, а не ставятся в очередь |
+| `limit_req_log_level warn` | Логирует отклонённые запросы для мониторинга |
